@@ -179,4 +179,10 @@ const (
 	MaxCompactIndexKeyLength = 240
 	// NumericPrecisionDigits is the number of precision digits for numeric calculations (16)
 	NumericPrecisionDigits = 16
+	// memoHeaderSize is the fixed size in bytes of the FPT header area (block 0..n
+	// reserved area, always 512 bytes regardless of the configured block size).
+	memoHeaderSize = 512
+	// defaultMemoBlockSize is used when NewTable receives a memo block size of 0.
+	// FoxPro defaults to 64 bytes per FPT block.
+	defaultMemoBlockSize uint16 = 64
 )

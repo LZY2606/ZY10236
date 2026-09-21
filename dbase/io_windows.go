@@ -6,6 +6,8 @@ package dbase
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -43,6 +45,9 @@ func (w WindowsIO) OpenTable(config *Config) (*File, error) {
 	}
 	err = w.initRelated(config, file)
 	if err != nil {
+		return nil, WrapError(err)
+	}
+	if err := validateOnOpen(file); err != nil {
 		return nil, WrapError(err)
 	}
 	return file, nil
@@ -130,6 +135,37 @@ func (w WindowsIO) fileMode(config *Config) int {
 }
 
 func (w WindowsIO) Close(file *File) error {
+	// Read-only handles never accepted writes and are closed without flushing.
+	if file.config.ReadOnly {
+		return w.closeHandles(file)
+	}
+	// Flush the FPT before the DBF, matching the Unix implementation: memo
+	// blocks must reach stable storage before the records referencing them.
+	if file.relatedHandle != nil {
+		relatedHandle, err := w.getRelatedHandle(file)
+		if err != nil {
+			return WrapError(err)
+		}
+		debugf("Flushing related file: %s", file.config.Filename)
+		if err := windows.FlushFileBuffers(*relatedHandle); err != nil {
+			return NewErrorf("flushing FPT file %v failed", file.config.Filename).Details(err)
+		}
+	}
+	if file.handle != nil {
+		handle, err := w.getHandle(file)
+		if err != nil {
+			return WrapError(err)
+		}
+		debugf("Flushing file: %s", file.config.Filename)
+		if err := windows.FlushFileBuffers(*handle); err != nil {
+			return NewErrorf("flushing DBF file %v failed", file.config.Filename).Details(err)
+		}
+	}
+	return w.closeHandles(file)
+}
+
+// closeHandles closes the DBF and FPT descriptors without flushing.
+func (w WindowsIO) closeHandles(file *File) error {
 	if file.handle != nil {
 		handle, err := w.getHandle(file)
 		if err != nil {
@@ -137,8 +173,7 @@ func (w WindowsIO) Close(file *File) error {
 		}
 
 		debugf("Closing file: %s", file.config.Filename)
-		err = windows.Close(*handle)
-		if err != nil {
+		if err := windows.Close(*handle); err != nil {
 			return NewErrorf("closing DBF file %v failed", file.config.Filename).Details(err)
 		}
 	}
@@ -149,8 +184,7 @@ func (w WindowsIO) Close(file *File) error {
 		}
 
 		debugf("Closing related file: %s", file.config.Filename)
-		err = windows.Close(*relatedHandle)
-		if err != nil {
+		if err := windows.Close(*relatedHandle); err != nil {
 			return NewErrorf("closing FPT file %v failed", file.config.Filename).Details(err)
 		}
 	}
@@ -207,13 +241,16 @@ func (w WindowsIO) ReadHeader(file *File) error {
 	}
 	b := make([]byte, 30)
 	n, err := windows.Read(*handle, b)
-	if err != nil {
+	if err != nil && !(err == io.EOF && n > 0) {
 		return NewErrorf("reading header failed").Details(err)
+	}
+	if n < len(b) {
+		return NewCorruptionError(CorruptDBFHeader, "DBF", "DBF header is shorter than the 32-byte record header").At(int64(n)).Size(int64(len(b)), int64(n))
 	}
 	// LittleEndian - Integers in table files are stored with the least significant byte first.
 	err = binary.Read(bytes.NewReader(b[:n]), binary.LittleEndian, h)
 	if err != nil {
-		return NewErrorf("reading header failed").Details(err)
+		return NewCorruptionError(CorruptDBFHeader, "DBF", "DBF header could not be decoded").Details(err)
 	}
 	file.header = h
 	return nil
@@ -426,13 +463,16 @@ func (w WindowsIO) ReadMemoHeader(file *File) error {
 	}
 	b := make([]byte, 8)
 	n, err := windows.Read(*relatedHandle, b)
-	if err != nil {
+	if err != nil && !(err == io.EOF && n > 0) {
 		return NewErrorf("reading memo header failed").Details(err)
+	}
+	if n < len(b) {
+		return NewCorruptionError(CorruptFPTHeader, "FPT", "memo header is shorter than 8 bytes").At(int64(n)).Size(int64(len(b)), int64(n))
 	}
 	h := &MemoHeader{}
 	err = binary.Read(bytes.NewReader(b[:n]), binary.BigEndian, h)
 	if err != nil {
-		return NewErrorf("reading memo header failed").Details(err)
+		return NewCorruptionError(CorruptFPTHeader, "FPT", "memo header could not be decoded").Details(err)
 	}
 	debugf("Memo header: %+v", h)
 	file.relatedHandle = relatedHandle
@@ -448,8 +488,11 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	if err != nil {
 		return nil, false, WrapError(err)
 	}
-	// Determine the block number
-	block := binary.LittleEndian.Uint32(address)
+	// Determine the block number and validate it against the physical FPT size.
+	block, err := validateMemoAddress(file, address, column)
+	if err != nil {
+		return nil, false, WrapError(err)
+	}
 	if block == 0 {
 		return []byte{}, false, nil
 	}
@@ -464,12 +507,17 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	// uints in one buffer and then convert, this saves seconds for large DBF files with many memo columns
 	// as it avoids using the reflection in binary.Read
 	hbuf := make([]byte, 8)
-	_, err = windows.Read(*relatedHandle, hbuf)
+	hread, err := windows.Read(*relatedHandle, hbuf)
 	if err != nil {
 		return nil, false, NewErrorf("reading memo block header failed").Details(err)
 	}
-	sign := binary.BigEndian.Uint32(hbuf[:4])
-	leng := binary.BigEndian.Uint32(hbuf[4:])
+	if hread < len(hbuf) {
+		return nil, false, NewCorruptionError(CorruptMemoBlock, "FPT", "memo block header is truncated").At(position)
+	}
+	sign, leng, verr := validateMemoBlock(file, block, position, hbuf)
+	if verr != nil {
+		return nil, false, WrapError(verr)
+	}
 	debugf("Memo block header for field %v => type: %v, binary: %v, length: %d", column.FieldName, sign, column.Flag.Has(byte(BinaryFlag)), leng)
 	if leng == 0 {
 		// No data according to block header? Not sure if this should be an error instead
@@ -482,7 +530,7 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 		return buf, sign == 1, NewErrorf("reading memo block data failed").Details(err)
 	}
 	if read != int(leng) {
-		return buf, sign == 1, NewErrorf("read %d bytes, expected %d", read, leng)
+		return buf, sign == 1, NewCorruptionError(CorruptMemoBlock, "FPT", "memo block data is truncated").At(position+8+int64(read)).Size(int64(leng), int64(read))
 	}
 	if sign == 1 || !column.Flag.Has(byte(BinaryFlag)) {
 		buf, err = file.config.Converter.Decode(buf)
@@ -504,6 +552,9 @@ func (w WindowsIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 	if err != nil {
 		return nil, WrapError(err)
 	}
+	// Every memo revision is appended at the next free block so an interrupted
+	// update leaves the previous record generation fully readable. See
+	// GenericIO.WriteMemo for the full crash-order rationale.
 	blocks := 1
 	blockPosition := file.memoHeader.NextFree
 	if length > 0 && file.memoHeader.BlockSize > 0 {
@@ -512,11 +563,7 @@ func (w WindowsIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 			blocks++
 		}
 	}
-	if !isEmptyBytes(address) {
-		debugf("memo address is not empty, writing to block %d", binary.LittleEndian.Uint32(address))
-		blockPosition = binary.LittleEndian.Uint32(address)
-		blocks = 0
-	}
+	_ = address
 	// Write the memo header
 	err = file.WriteMemoHeader(blocks)
 	if err != nil {
@@ -559,9 +606,12 @@ func (w WindowsIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 		return nil, NewErrorf("seeking to the beginning of the file failed").Details(err)
 	}
 	// Write the memo data
-	_, err = windows.Write(*relatedHandle, data)
+	wrote, err := windows.Write(*relatedHandle, data)
 	if err != nil {
 		return nil, NewErrorf("writing memo data failed").Details(err)
+	}
+	if wrote != len(data) {
+		return nil, NewErrorf("wrote %d memo bytes, expected %d", wrote, len(data)).Details(io.ErrShortWrite)
 	}
 	// Convert the block number to []byte
 	address, err = toBinary(blockPosition)
@@ -638,7 +688,10 @@ func (w WindowsIO) ReadRow(file *File, position uint32) ([]byte, error) {
 		return buf, NewErrorf("reading row %d failed", position).Details(err)
 	}
 	if read != int(file.header.RowLength) {
-		return buf, NewErrorf("read %d bytes, expected %d", read, file.header.RowLength)
+		return buf, NewCorruptionError(CorruptTruncatedRecord, "DBF", "record is shorter than the declared row length").At(pos).AtRecord(int64(position)).Size(int64(file.header.RowLength), int64(read))
+	}
+	if Marker(buf[0]) != Active && Marker(buf[0]) != Deleted {
+		return buf, NewCorruptionError(CorruptInvalidRecordMarker, "DBF", fmt.Sprintf("record starts with unknown marker 0x%02x", buf[0])).At(pos).AtRecord(int64(position))
 	}
 	return buf, nil
 }
@@ -700,9 +753,12 @@ func (w WindowsIO) WriteRow(file *File, row *Row) (err error) {
 		return NewErrorf("seeking to position %d failed", position).Details(err)
 	}
 	// Write the row
-	_, err = windows.Write(*handle, r)
+	wrote, err := windows.Write(*handle, r)
 	if err != nil {
 		return NewErrorf("writing row %d failed", row.Position).Details(err)
+	}
+	if wrote != len(r) {
+		return NewErrorf("wrote %d row bytes, expected %d", wrote, len(r)).Details(io.ErrShortWrite)
 	}
 	return nil
 }

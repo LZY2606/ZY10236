@@ -591,14 +591,24 @@ func NewTable(version FileVersion, config *Config, columns []*Column, memoBlockS
 		// Add columns to the table
 		file.table.columns = append(file.table.columns, column)
 	}
-	// If there are memo fields, add the memo header
+	// If there are memo fields, add the memo header. The FPT always starts with
+	// a 512-byte header area even when the configured block size is smaller, so
+	// the first usable block starts at ceil(512/blockSize). Starting at block 0
+	// would make the first memo allocation collide with the header itself.
 	if memoField {
+		if memoBlockSize == 0 {
+			memoBlockSize = defaultMemoBlockSize
+		}
+		firstBlock := uint32(memoHeaderSize) / uint32(memoBlockSize)
+		if uint32(memoHeaderSize)%uint32(memoBlockSize) != 0 {
+			firstBlock++
+		}
 		file.memoHeader = &MemoHeader{
-			NextFree:  0,
+			NextFree:  firstBlock,
 			Unused:    [2]byte{0x00, 0x00},
 			BlockSize: memoBlockSize,
 		}
-		debugf("Initializing related memo file header - block size: %v", file.memoHeader.BlockSize)
+		debugf("Initializing related memo file header - block size: %v, first free block: %v", file.memoHeader.BlockSize, file.memoHeader.NextFree)
 	}
 	// If there are nullable or variable length fields, add the null flag column
 	if nullFlagLength > 0 {

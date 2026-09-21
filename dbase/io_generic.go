@@ -79,10 +79,42 @@ func (g GenericIO) OpenTable(config *Config) (*File, error) {
 			return nil, WrapError(err)
 		}
 	}
+	if err := validateOnOpen(file); err != nil {
+		return nil, WrapError(err)
+	}
 	return file, nil
 }
 
 func (g GenericIO) Close(file *File) error {
+	// Read-only handles are closed without a flush.
+	if file.config.ReadOnly {
+		return g.closeHandles(file)
+	}
+	// Flush the memo file first and the DBF second: a memo block is always
+	// written before its address is published in a record, so the FPT is the
+	// dependency of the DBF, never the other way round. Handles without a Sync
+	// method (pure in-memory readers) are simply closed.
+	if file.relatedHandle != nil {
+		debugf("Flushing FPT handle before close: %T %s", file.relatedHandle, file.config.Filename)
+		if syncer, ok := file.relatedHandle.(interface{ Sync() error }); ok {
+			if err := syncer.Sync(); err != nil {
+				return NewErrorf("flushing FPT failed").Details(err)
+			}
+		}
+	}
+	if file.handle != nil {
+		debugf("Flushing DBF handle before close: %T %s", file.handle, file.config.Filename)
+		if syncer, ok := file.handle.(interface{ Sync() error }); ok {
+			if err := syncer.Sync(); err != nil {
+				return NewErrorf("flushing DBF failed").Details(err)
+			}
+		}
+	}
+	return g.closeHandles(file)
+}
+
+// closeHandles closes the DBF and FPT handles without flushing.
+func (g GenericIO) closeHandles(file *File) error {
 	if file.handle != nil {
 		handle, ok := file.handle.(io.Closer)
 		if !ok {
@@ -90,8 +122,7 @@ func (g GenericIO) Close(file *File) error {
 		}
 
 		debugf("Closing DBF handle: %T %s", file.handle, file.config.Filename)
-		err := handle.Close()
-		if err != nil {
+		if err := handle.Close(); err != nil {
 			return NewErrorf("closing DBF failed").Details(err)
 		}
 	}
@@ -102,8 +133,7 @@ func (g GenericIO) Close(file *File) error {
 		}
 
 		debugf("Closing FPT handle: %T %s", file.relatedHandle, file.config.Filename)
-		err := relatedHandle.Close()
-		if err != nil {
+		if err := relatedHandle.Close(); err != nil {
 			return NewErrorf("closing FPT failed").Details(err)
 		}
 	}
@@ -130,14 +160,17 @@ func (g GenericIO) ReadHeader(file *File) error {
 	}
 	b := make([]byte, 30)
 	n, err := handle.Read(b)
-	if err != nil {
+	if err != nil && !(err == io.EOF && n > 0) {
 		return NewErrorf("failed to read header").Details(err)
+	}
+	if n < len(b) {
+		return NewCorruptionError(CorruptDBFHeader, "DBF", "DBF header is shorter than the 32-byte record header").At(int64(n)).Size(int64(len(b)), int64(n))
 	}
 	h := &Header{}
 	// LittleEndian - Integers in table files are stored with the least significant byte first.
 	err = binary.Read(bytes.NewReader(b[:n]), binary.LittleEndian, h)
 	if err != nil {
-		return NewErrorf("failed to read header").Details(err)
+		return NewCorruptionError(CorruptDBFHeader, "DBF", "DBF header could not be decoded").Details(err)
 	}
 	file.header = h
 	return nil
@@ -170,7 +203,7 @@ func (g GenericIO) WriteHeader(file *File) error {
 	}
 
 	if b != len(buf.Bytes()) {
-		return NewErrorf("wrote %d bytes, expected %d", b, len(buf.Bytes()))
+		return NewErrorf("wrote %d bytes, expected %d", b, len(buf.Bytes())).Details(io.ErrShortWrite)
 	}
 
 	return nil
@@ -286,13 +319,16 @@ func (g GenericIO) ReadMemoHeader(file *File) error {
 	}
 	b := make([]byte, 8)
 	n, err := relatedHandle.Read(b)
-	if err != nil {
+	if err != nil && !(err == io.EOF && n > 0) {
 		// return newError("dbase-io-generic-readmemoheader-3", err)
 		return NewErrorf("failed to read memo header").Details(err)
 	}
+	if n < len(b) {
+		return NewCorruptionError(CorruptFPTHeader, "FPT", "memo header is shorter than 8 bytes").At(int64(n)).Size(int64(len(b)), int64(n))
+	}
 	err = binary.Read(bytes.NewReader(b[:n]), binary.BigEndian, h)
 	if err != nil {
-		return NewErrorf("failed to read memo header").Details(err)
+		return NewCorruptionError(CorruptFPTHeader, "FPT", "memo header could not be decoded").Details(err)
 	}
 	debugf("Memo header: %+v", h)
 	file.memoHeader = h
@@ -334,8 +370,11 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	if err != nil {
 		return nil, false, WrapError(err)
 	}
-	// Determine the block number
-	block := binary.LittleEndian.Uint32(address)
+	// Determine the block number and validate it against the physical FPT size.
+	block, err := validateMemoAddress(file, address, column)
+	if err != nil {
+		return nil, false, WrapError(err)
+	}
 	if block == 0 {
 		return []byte{}, false, nil
 	}
@@ -350,12 +389,17 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	// uints in one buffer and then convert, this saves seconds for large DBF files with many memo columns
 	// as it avoids using the reflection in binary.Read
 	hbuf := make([]byte, 8)
-	_, err = relatedHandle.Read(hbuf)
+	hread, err := relatedHandle.Read(hbuf)
 	if err != nil {
 		return nil, false, NewErrorf("failed to read memo block header").Details(err)
 	}
-	sign := binary.BigEndian.Uint32(hbuf[:4])
-	leng := binary.BigEndian.Uint32(hbuf[4:])
+	if hread < len(hbuf) {
+		return nil, false, NewCorruptionError(CorruptMemoBlock, "FPT", "memo block header is truncated").At(position)
+	}
+	sign, leng, verr := validateMemoBlock(file, block, position, hbuf)
+	if verr != nil {
+		return nil, false, WrapError(verr)
+	}
 	debugf("Memo block header => text: %v, length: %d", sign == 1, leng)
 	if leng == 0 {
 		// No data according to block header? Not sure if this should be an error instead
@@ -368,7 +412,7 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 		return buf, sign == 1, NewErrorf("failed to read memo block data").Details(err)
 	}
 	if read != int(leng) {
-		return buf, sign == 1, NewErrorf("read %d bytes, expected %d", read, leng)
+		return buf, sign == 1, NewCorruptionError(CorruptMemoBlock, "FPT", "memo block data is truncated").At(position+8+int64(read)).Size(int64(leng), int64(read))
 	}
 	if sign == 1 || !column.Flag.Has(byte(BinaryFlag)) {
 		buf, err = file.config.Converter.Decode(buf)
@@ -390,7 +434,12 @@ func (g GenericIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 	if err != nil {
 		return nil, WrapError(err)
 	}
-	// Get the block position
+	// Every memo revision is appended at the next free block. Overwriting the
+	// previously referenced block would interleave old and new generations of
+	// the record while the record pointer in the DBF is only published after
+	// the block is fully written; reserving a fresh block keeps the failure
+	// boundary at "old record" or "new record" instead of a mix of both. The
+	// previously referenced block becomes unreachable space until compaction.
 	blocks := 1
 	blockPosition := file.memoHeader.NextFree
 	if length > 0 && file.memoHeader.BlockSize > 0 {
@@ -399,10 +448,7 @@ func (g GenericIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 			blocks++
 		}
 	}
-	if !isEmptyBytes(address) {
-		blockPosition = binary.LittleEndian.Uint32(address)
-		blocks = 0
-	}
+	_ = address
 	// Write the memo header
 	err = file.WriteMemoHeader(blocks)
 	if err != nil {
@@ -428,9 +474,12 @@ func (g GenericIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 		return nil, NewErrorf("failed to seek to position %d", position).Details(err)
 	}
 	// Write the memo data
-	_, err = relatedHandle.Write(data)
+	wrote, err := relatedHandle.Write(data)
 	if err != nil {
 		return nil, NewErrorf("failed to write memo data").Details(err)
+	}
+	if wrote != len(data) {
+		return nil, NewErrorf("wrote %d memo bytes, expected %d", wrote, len(data)).Details(io.ErrShortWrite)
 	}
 	// Convert the block number to []byte
 	address, err = toBinary(blockPosition)
@@ -480,17 +529,19 @@ func (g GenericIO) ReadRow(file *File, position uint32) ([]byte, error) {
 	}
 	pos := int64(file.header.FirstRow) + (int64(position) * int64(file.header.RowLength))
 	debugf("Reading row: %d at offset: %v", position, pos)
-	buf := make([]byte, file.header.RowLength)
-	_, err = handle.Seek(pos, 0)
-	if err != nil {
-		return buf, NewErrorf("failed to seek to position %d", pos).Details(err)
+	if _, err := handle.Seek(pos, 0); err != nil {
+		return nil, NewErrorf("failed to seek to position %d", pos).Details(err)
 	}
+	buf := make([]byte, file.header.RowLength)
 	read, err := handle.Read(buf)
 	if err != nil {
 		return buf, NewErrorf("failed to read row data").Details(err)
 	}
 	if read != int(file.header.RowLength) {
-		return buf, NewErrorf("read %d bytes, expected %d", read, file.header.RowLength)
+		return buf, NewCorruptionError(CorruptTruncatedRecord, "DBF", "record is shorter than the declared row length").At(pos).AtRecord(int64(position)).Size(int64(file.header.RowLength), int64(read))
+	}
+	if Marker(buf[0]) != Active && Marker(buf[0]) != Deleted {
+		return buf, NewCorruptionError(CorruptInvalidRecordMarker, "DBF", fmt.Sprintf("record starts with unknown marker 0x%02x", buf[0])).At(pos).AtRecord(int64(position))
 	}
 	return buf, nil
 }
@@ -529,14 +580,16 @@ func (g GenericIO) WriteRow(file *File, row *Row) error {
 	}
 	debugf("Writing row: %d at offset: %v", row.Position, position)
 	// Seek to the correct position
-	_, err = handle.Seek(position, 0)
-	if err != nil {
+	if _, err := handle.Seek(position, 0); err != nil {
 		return NewErrorf("failed to seek to position %d", position).Details(err)
 	}
 	// Write the row
-	_, err = handle.Write(r)
+	wrote, err := handle.Write(r)
 	if err != nil {
 		return NewErrorf("failed to write row data").Details(err)
+	}
+	if wrote != len(r) {
+		return NewErrorf("wrote %d row bytes, expected %d", wrote, len(r)).Details(io.ErrShortWrite)
 	}
 	return nil
 }

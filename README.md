@@ -453,6 +453,29 @@ Explore comprehensive examples in the [examples](./examples/) directory:
 - 🔌 **[Reader Data Source](./examples/reader/reader.go)** - Using custom io.ReadWriteSeeker implementations
 - 🔧 **[Custom IO](./examples/custom/custom.go)** - Advanced custom data source integration
 
+## Crash Consistency and Recovery
+
+A table is two independent files (`.DBF` and `.FPT`), so cross-file
+transactions are not possible without an external journal. The library does
+provide explicit crash boundaries and structural diagnostics for the states a
+failed write can leave behind:
+
+- Memo blocks are reserved and written **before** their address is published
+  in a DBF record, and every memo revision is appended at a fresh block
+  instead of being overwritten.
+- Appended records publish the header count first; a header without the
+  record bytes is diagnosed as corruption on reopen instead of returning
+  zero-filled data.
+- `Close` flushes the FPT before the DBF (`fsync` / `FlushFileBuffers`).
+- Reopen returns the complete old generation, the complete new generation, or
+  a structured `dbase.CorruptionError` (`errors.Is(err, dbase.ErrCorruption)`)
+  — never a record whose plain fields and memos come from two generations.
+
+These guarantees, the format-inherent limits (undetectable tearing inside a
+checksum-free record), complexity and compatibility notes are documented in
+[docs/crash-consistency.md](docs/crash-consistency.md) and pinned by the
+fault-injection recovery tests in `dbase/recovery_*_test.go`.
+
 ## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
