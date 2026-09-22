@@ -438,6 +438,34 @@ for !table.EOF() {
 }
 ```
 
+## Crash Recovery and Durability
+
+DBF records and FPT memo blocks live in two separate files, so cross-file
+transactional atomicity is impossible. The library instead fixes a clear
+atomic boundary per write: memo blocks are fully written **before** their
+pointer is published in the DBF record, and memo updates allocate fresh
+blocks instead of overwriting in place. After a crash you therefore reopen
+either the complete old record, the complete new record, or receive a
+structured corruption error - never a record spliced from two generations.
+
+```go
+// Optional durable checkpoint (syncs DBF then FPT, per file)
+if err := table.Flush(); err != nil {
+    // one of the syncs failed; inspect before continuing
+}
+
+// Diagnose the pair after a suspected crash
+finding, err := table.CheckIntegrity()
+if errors.Is(err, dbase.ErrCorrupt) {
+    var c *dbase.CorruptionError
+    errors.As(err, &c) // Kind, File, Offset, Detail
+}
+// finding.LeakedBlocks > 0: reserved but unreachable memo space (not data loss)
+```
+
+See [docs/durability.md](./docs/durability.md) for the full write order,
+guarantees, corruption kinds, complexity and compatibility trade-offs.
+
 ## Complete Examples
 
 Explore comprehensive examples in the [examples](./examples/) directory:

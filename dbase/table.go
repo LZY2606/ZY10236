@@ -591,14 +591,26 @@ func NewTable(version FileVersion, config *Config, columns []*Column, memoBlockS
 		// Add columns to the table
 		file.table.columns = append(file.table.columns, column)
 	}
-	// If there are memo fields, add the memo header
+	// If there are memo fields, add the memo header. The FPT header occupies
+	// 512 bytes: with the standard 64 byte block size that is 8 blocks, so the
+	// first allocatable block must already be 8 (real FoxPro files do exactly
+	// this). Starting at 0 would make the first memo allocation overwrite the
+	// memo file header itself.
 	if memoField {
+		initialNextFree := uint32(8)
+		if memoBlockSize != 64 && memoBlockSize > 0 {
+			initialNextFree = uint32(512) / uint32(memoBlockSize)
+			if uint32(512)%uint32(memoBlockSize) > 0 {
+				initialNextFree++
+			}
+		}
 		file.memoHeader = &MemoHeader{
-			NextFree:  0,
+			NextFree:  initialNextFree,
 			Unused:    [2]byte{0x00, 0x00},
 			BlockSize: memoBlockSize,
 		}
-		debugf("Initializing related memo file header - block size: %v", file.memoHeader.BlockSize)
+		debugf("Initializing related memo file header - block size: %v, first free block: %v",
+			file.memoHeader.BlockSize, file.memoHeader.NextFree)
 	}
 	// If there are nullable or variable length fields, add the null flag column
 	if nullFlagLength > 0 {

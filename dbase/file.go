@@ -247,7 +247,9 @@ func (file *File) BytesToRow(data []byte) (*Row, error) {
 	// a row should start with te delete flag, a space ACTIVE(0x20) or DELETED(0x2A)
 	rec.Deleted = Marker(data[0]) == Deleted
 	if !rec.Deleted && Marker(data[0]) != Active {
-		return nil, NewError("invalid row data, no delete flag found at beginning of row")
+		off := int64(file.header.FirstRow) + int64(file.table.rowPointer)*int64(file.header.RowLength)
+		return nil, newCorruption(CorruptRecordMarker, "DBF", off,
+			"record "+itoa(int(file.table.rowPointer)+1)+" has marker 0x"+hexByte(data[0]))
 	}
 	// deleted flag already read
 	offset := uint16(1)

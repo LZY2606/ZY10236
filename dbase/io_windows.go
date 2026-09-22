@@ -6,6 +6,7 @@ package dbase
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -454,6 +455,18 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 		return []byte{}, false, nil
 	}
 	position := int64(file.memoHeader.BlockSize) * int64(block)
+	if int64(file.memoHeader.BlockSize) <= 0 || position < int64(file.memoHeader.BlockSize) {
+		return nil, false, newCorruption(CorruptMemoPointer, "FPT", position,
+			"column "+column.Name()+" points at invalid block "+itoa(int(block)))
+	}
+	fptSize, sizeErr := platformHandleSize(relatedHandle)
+	if sizeErr != nil {
+		return nil, false, WrapError(sizeErr)
+	}
+	if position >= fptSize {
+		return nil, false, newCorruption(CorruptMemoPointer, "FPT", position,
+			"column "+column.Name()+" points at block "+itoa(int(block))+" beyond FPT size "+itoa(int(fptSize)))
+	}
 	debugf("Reading memo block %d at position %d", block, position)
 	// The position in the file is blocknumber*blocksize
 	_, err = windows.Seek(*relatedHandle, position, 0)
@@ -464,9 +477,9 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	// uints in one buffer and then convert, this saves seconds for large DBF files with many memo columns
 	// as it avoids using the reflection in binary.Read
 	hbuf := make([]byte, 8)
-	_, err = windows.Read(*relatedHandle, hbuf)
-	if err != nil {
-		return nil, false, NewErrorf("reading memo block header failed").Details(err)
+	if _, err = readFullWindows(*relatedHandle, hbuf); err != nil {
+		return nil, false, newCorruption(CorruptMemoBlock, "FPT", position,
+			"column "+column.Name()+" block "+itoa(int(block))+" header unreadable").wrap(err)
 	}
 	sign := binary.BigEndian.Uint32(hbuf[:4])
 	leng := binary.BigEndian.Uint32(hbuf[4:])
@@ -475,14 +488,21 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 		// No data according to block header? Not sure if this should be an error instead
 		return []byte{}, sign == 1, nil
 	}
+	if position+8+int64(leng) > fptSize {
+		return nil, false, newCorruption(CorruptMemoBlock, "FPT", position,
+			"column "+column.Name()+" block "+itoa(int(block))+" declares "+itoa(int(leng))+
+				" payload bytes but the FPT ends at "+itoa(int(fptSize)))
+	}
 	// Now read the actual data
 	buf := make([]byte, leng)
-	read, err := windows.Read(*relatedHandle, buf)
+	read, err := readFullWindows(*relatedHandle, buf)
 	if err != nil {
-		return buf, sign == 1, NewErrorf("reading memo block data failed").Details(err)
+		return buf, sign == 1, newCorruption(CorruptMemoBlock, "FPT", position+8,
+			"column "+column.Name()+" block "+itoa(int(block))+" payload unreadable").wrap(err)
 	}
 	if read != int(leng) {
-		return buf, sign == 1, NewErrorf("read %d bytes, expected %d", read, leng)
+		return buf, sign == 1, newCorruption(CorruptMemoBlock, "FPT", position+8,
+			"column "+column.Name()+" block "+itoa(int(block))+" payload short: read "+itoa(read)+" of "+itoa(int(leng)))
 	}
 	if sign == 1 || !column.Flag.Has(byte(BinaryFlag)) {
 		buf, err = file.config.Converter.Decode(buf)
@@ -504,20 +524,20 @@ func (w WindowsIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 	if err != nil {
 		return nil, WrapError(err)
 	}
+	// A memo update always allocates a fresh block instead of overwriting the
+	// previously referenced one. In-place overwrite could splice old and new
+	// generations on a mid-write failure and growing data in place would
+	// corrupt the header of the following block. The old block becomes
+	// unreachable space (see File.CheckIntegrity) until external packing.
 	blocks := 1
-	blockPosition := file.memoHeader.NextFree
 	if length > 0 && file.memoHeader.BlockSize > 0 {
 		blocks = length / int(file.memoHeader.BlockSize)
 		if length%int(file.memoHeader.BlockSize) > 0 {
 			blocks++
 		}
 	}
-	if !isEmptyBytes(address) {
-		debugf("memo address is not empty, writing to block %d", binary.LittleEndian.Uint32(address))
-		blockPosition = binary.LittleEndian.Uint32(address)
-		blocks = 0
-	}
-	// Write the memo header
+	blockPosition := file.memoHeader.NextFree
+	// Write the memo header (advances the next-free counter)
 	err = file.WriteMemoHeader(blocks)
 	if err != nil {
 		return nil, WrapError(err)
@@ -633,12 +653,14 @@ func (w WindowsIO) ReadRow(file *File, position uint32) ([]byte, error) {
 	if err != nil {
 		return buf, NewErrorf("seeking to position %d failed", pos).Details(err)
 	}
-	read, err := windows.Read(*handle, buf)
+	read, err := readFullWindows(*handle, buf)
 	if err != nil {
-		return buf, NewErrorf("reading row %d failed", position).Details(err)
+		return buf, newCorruption(CorruptRecordTruncated, "DBF", pos,
+			"record "+itoa(int(position)+1)+" read failed").wrap(err)
 	}
 	if read != int(file.header.RowLength) {
-		return buf, NewErrorf("read %d bytes, expected %d", read, file.header.RowLength)
+		return buf, newCorruption(CorruptRecordTruncated, "DBF", pos,
+			"record "+itoa(int(position)+1)+" is short: read "+itoa(read)+" of "+itoa(int(file.header.RowLength))+" bytes")
 	}
 	return buf, nil
 }
@@ -823,4 +845,22 @@ func (w WindowsIO) getRelatedHandle(file *File) (*windows.Handle, error) {
 		return nil, WrapError(ErrNoFPT)
 	}
 	return handle, nil
+}
+
+// readFullWindows loops windows.Read until len(p) bytes are read or a call
+// returns an error/no progress, mirroring io.ReadFull semantics for raw
+// Windows handles (a single ReadFile may return fewer bytes than requested).
+func readFullWindows(handle windows.Handle, p []byte) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := windows.Read(handle, p[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrUnexpectedEOF
+		}
+	}
+	return total, nil
 }

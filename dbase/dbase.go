@@ -11,6 +11,9 @@
 //   - Safe concurrent operations with built-in synchronization
 //   - Comprehensive error handling with detailed trace information
 //   - Navigation and search capabilities within tables
+//   - Crash-recovery boundary: memo blocks are written before their pointer
+//     is published, File.Flush syncs both files and File.CheckIntegrity
+//     diagnoses cross-file inconsistencies (see docs/durability.md)
 //
 // Supported Data Types:
 //   - Character (C), Memo (M), Varchar (V) - string data

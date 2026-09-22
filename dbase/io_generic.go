@@ -251,9 +251,12 @@ func (g GenericIO) WriteColumns(file *File) error {
 			return NewError("failed to write null flag column").Details(err)
 		}
 	}
-	_, err = handle.Write(buf.Bytes())
+	wrote, err := handle.Write(buf.Bytes())
 	if err != nil {
 		return NewErrorf("failed to write columns").Details(err)
+	}
+	if wrote != buf.Len() {
+		return NewErrorf("wrote %d column bytes, expected %d", wrote, buf.Len())
 	}
 	// Write the column terminator
 	_, err = handle.Write([]byte{byte(ColumnEnd)})
@@ -317,14 +320,21 @@ func (g GenericIO) WriteMemoHeader(file *File, size int) error {
 	binary.BigEndian.PutUint32(buf[:4], file.memoHeader.NextFree)
 	binary.BigEndian.PutUint16(buf[6:8], file.memoHeader.BlockSize)
 	debugf("Writing memo header - next free: %d, block size: %d", file.memoHeader.NextFree, file.memoHeader.BlockSize)
-	_, err = relatedHandle.Write(buf)
+	wrote, err := relatedHandle.Write(buf)
 	if err != nil {
 		return NewErrorf("failed to write memo header").Details(err)
 	}
+	if wrote != len(buf) {
+		return NewErrorf("wrote %d memo header bytes, expected %d", wrote, len(buf))
+	}
 	// Write null till end of header
-	_, err = relatedHandle.Write(make([]byte, 512-8))
+	padding := make([]byte, 512-8)
+	wrote, err = relatedHandle.Write(padding)
 	if err != nil {
 		return NewErrorf("failed to write null till end of header").Details(err)
+	}
+	if wrote != len(padding) {
+		return NewErrorf("wrote %d memo header padding bytes, expected %d", wrote, len(padding))
 	}
 	return nil
 }
@@ -340,6 +350,18 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 		return []byte{}, false, nil
 	}
 	position := int64(file.memoHeader.BlockSize) * int64(block)
+	if int64(file.memoHeader.BlockSize) <= 0 || position < int64(file.memoHeader.BlockSize) {
+		return nil, false, newCorruption(CorruptMemoPointer, "FPT", position,
+			"column "+column.Name()+" points at invalid block "+itoa(int(block)))
+	}
+	fptSize, sizeErr := handleSize(relatedHandle)
+	if sizeErr != nil {
+		return nil, false, WrapError(sizeErr)
+	}
+	if position >= fptSize {
+		return nil, false, newCorruption(CorruptMemoPointer, "FPT", position,
+			"column "+column.Name()+" points at block "+itoa(int(block))+" beyond FPT size "+itoa(int(fptSize)))
+	}
 	debugf("Reading memo block %d at position %d", block, position)
 	// The position in the file is blocknumber*blocksize
 	_, err = relatedHandle.Seek(position, 0)
@@ -350,9 +372,9 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	// uints in one buffer and then convert, this saves seconds for large DBF files with many memo columns
 	// as it avoids using the reflection in binary.Read
 	hbuf := make([]byte, 8)
-	_, err = relatedHandle.Read(hbuf)
-	if err != nil {
-		return nil, false, NewErrorf("failed to read memo block header").Details(err)
+	if _, err = io.ReadFull(relatedHandle, hbuf); err != nil {
+		return nil, false, newCorruption(CorruptMemoBlock, "FPT", position,
+			"column "+column.Name()+" block "+itoa(int(block))+" header unreadable").wrap(err)
 	}
 	sign := binary.BigEndian.Uint32(hbuf[:4])
 	leng := binary.BigEndian.Uint32(hbuf[4:])
@@ -361,14 +383,21 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 		// No data according to block header? Not sure if this should be an error instead
 		return []byte{}, sign == 1, nil
 	}
+	if position+8+int64(leng) > fptSize {
+		return nil, false, newCorruption(CorruptMemoBlock, "FPT", position,
+			"column "+column.Name()+" block "+itoa(int(block))+" declares "+itoa(int(leng))+
+				" payload bytes but the FPT ends at "+itoa(int(fptSize)))
+	}
 	// Now read the actual data
 	buf := make([]byte, leng)
-	read, err := relatedHandle.Read(buf)
+	read, err := io.ReadFull(relatedHandle, buf)
 	if err != nil {
-		return buf, sign == 1, NewErrorf("failed to read memo block data").Details(err)
+		return buf, sign == 1, newCorruption(CorruptMemoBlock, "FPT", position+8,
+			"column "+column.Name()+" block "+itoa(int(block))+" payload unreadable").wrap(err)
 	}
 	if read != int(leng) {
-		return buf, sign == 1, NewErrorf("read %d bytes, expected %d", read, leng)
+		return buf, sign == 1, newCorruption(CorruptMemoBlock, "FPT", position+8,
+			"column "+column.Name()+" block "+itoa(int(block))+" payload short: read "+itoa(read)+" of "+itoa(int(leng)))
 	}
 	if sign == 1 || !column.Flag.Has(byte(BinaryFlag)) {
 		buf, err = file.config.Converter.Decode(buf)
@@ -390,20 +419,22 @@ func (g GenericIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 	if err != nil {
 		return nil, WrapError(err)
 	}
-	// Get the block position
+	// A memo update always allocates a fresh block instead of overwriting the
+	// previously referenced one. Overwriting in place would alias the block:
+	// a failure between the block write and the record pointer update could
+	// leave a record reading spliced old/new bytes, and growing data in place
+	// would overwrite the header of whatever block follows. The old block
+	// becomes unreachable space, reported as a free-list finding by
+	// File.CheckIntegrity, until the memo file is packed externally.
 	blocks := 1
-	blockPosition := file.memoHeader.NextFree
 	if length > 0 && file.memoHeader.BlockSize > 0 {
 		blocks = length / int(file.memoHeader.BlockSize)
 		if length%int(file.memoHeader.BlockSize) > 0 {
 			blocks++
 		}
 	}
-	if !isEmptyBytes(address) {
-		blockPosition = binary.LittleEndian.Uint32(address)
-		blocks = 0
-	}
-	// Write the memo header
+	blockPosition := file.memoHeader.NextFree
+	// Write the memo header (advances the next-free counter)
 	err = file.WriteMemoHeader(blocks)
 	if err != nil {
 		return nil, WrapError(err)
@@ -427,12 +458,18 @@ func (g GenericIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 	if err != nil {
 		return nil, NewErrorf("failed to seek to position %d", position).Details(err)
 	}
-	// Write the memo data
-	_, err = relatedHandle.Write(data)
+	// Write the memo data. A short write leaves a partially initialized block
+	// that is never referenced because the new pointer is only returned to the
+	// caller afterwards, so the failure is recoverable as leaked memo space.
+	wrote, err := relatedHandle.Write(data)
 	if err != nil {
 		return nil, NewErrorf("failed to write memo data").Details(err)
 	}
-	// Convert the block number to []byte
+	if wrote != len(data) {
+		return nil, NewErrorf("wrote %d bytes, expected %d", wrote, len(data))
+	}
+	// Convert the block number to []byte. Only now, after the block header and
+	// payload are written, does the DBF record learn the new block number.
 	address, err = toBinary(blockPosition)
 	if err != nil {
 		return nil, WrapError(err)
@@ -487,10 +524,12 @@ func (g GenericIO) ReadRow(file *File, position uint32) ([]byte, error) {
 	}
 	read, err := handle.Read(buf)
 	if err != nil {
-		return buf, NewErrorf("failed to read row data").Details(err)
+		return buf, newCorruption(CorruptRecordTruncated, "DBF", pos,
+			"record "+itoa(int(position)+1)+" read failed").wrap(err)
 	}
 	if read != int(file.header.RowLength) {
-		return buf, NewErrorf("read %d bytes, expected %d", read, file.header.RowLength)
+		return buf, newCorruption(CorruptRecordTruncated, "DBF", pos,
+			"record "+itoa(int(position)+1)+" is short: read "+itoa(read)+" of "+itoa(int(file.header.RowLength))+" bytes")
 	}
 	return buf, nil
 }
@@ -533,10 +572,15 @@ func (g GenericIO) WriteRow(file *File, row *Row) error {
 	if err != nil {
 		return NewErrorf("failed to seek to position %d", position).Details(err)
 	}
-	// Write the row
-	_, err = handle.Write(r)
+	// Write the row. The header count was already committed, therefore a
+	// short/failed record write is diagnosed as truncation on the next open
+	// instead of silently exposing an uninitialized record region.
+	wrote, err := handle.Write(r)
 	if err != nil {
 		return NewErrorf("failed to write row data").Details(err)
+	}
+	if wrote != len(r) {
+		return NewErrorf("wrote %d bytes, expected %d", wrote, len(r))
 	}
 	return nil
 }

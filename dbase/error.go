@@ -81,12 +81,33 @@ func (e Error) Error() string {
 	return fmt.Sprintf("%s %s", e.msg, details)
 }
 
+// Unwrap exposes the errors attached with Details so errors.Is and errors.As
+// keep working through the package's Error wrapper.
+func (e Error) Unwrap() []error {
+	if len(e.details) == 0 {
+		return nil
+	}
+	return e.details
+}
+
 // WrapError wraps an existing error into a dbase Error with trace information.
 func WrapError(err error) Error {
 	if err == nil {
 		return NewError("unknown error occurred - cant wrap nil error")
 	}
 	if e, ok := err.(Error); ok {
+		e.trace = traceError(e)
+		return e
+	}
+	// Preserve structured corruption diagnoses through every wrapping layer so
+	// errors.As(err, &*CorruptionError) keeps working after reopen.
+	var corruption *CorruptionError
+	if errors.As(err, &corruption) {
+		e := Error{
+			msg:     err.Error(),
+			trace:   make([]string, 0),
+			details: []error{err},
+		}
 		e.trace = traceError(e)
 		return e
 	}
